@@ -36,9 +36,18 @@ def create_task(text):
     get_ymq_queue().send_message(MessageBody=js.dumps({'text': text}))
 
 def handler(event, context):
-    create_task(event)
+    request = js.loads(event['body'])
+
+    if request['type'] == 'message_event':
+        create_task(event)
+    
+    elif request['type'] == 'message_new':
+        message_text = request['object']['message']['text'].split()
+
+        if '@ucosuraspisanie' in message_text[0] or message_text[0] == '/osu':
+            create_task(event)
 
     return {
         'statusCode': 200,
         'body': 'ok'
-    }                 
+    }              
