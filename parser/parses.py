@@ -8,166 +8,198 @@ from requests_futures import sessions
 
 db = Database()
 
-class Parse():
-    def group_parse(vk, peer_id, cmid, date, group):
-        text = f'Расписание для группы {group}\n\n'
-        week_day = datetime.strptime(date, '%d-%m-%Y')
-        week_day = datetime.isoweekday(week_day)
-        days = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота']
+errors = ['ConnectionError', 'ExpValueError', 'WeekendError']
 
-        if week_day == 7:
-            functions.edit_message(vk, peer_id, cmid, text = 'Это выходной, отдохни. Уже совсем бошка не варит :|')
-            return
-
-        for i in range(week_day, 7, 1):         
-            date_response = requests.post('https://www.uc.osu.ru/back_parametr.php', data = {'type_id': '1', 'data': date})
-            try:
-                date_response_dict = json.loads(date_response.text)
-            except:
-                date = functions.return_date(date, 1)
-                continue
-            
-            if date_response_dict:
-                for key, value in date_response_dict.items():
-                    if value.lower() == group.lower():
-                        group_id = key
-                        db.create_note(chat_id = peer_id, groups = value.upper())
-                
-                response = requests.post('https://www.uc.osu.ru/generate_data.php', data = {'type': '1', 'data': date, 'id': group_id})
-                result = bs(response.text, 'lxml')
-            
-                if len(result) == 0:
-                    continue
-                    
-                subjects = result.find_all('td')
-                
-                if len(subjects) == 2:
-                    continue
-
-                text += f'{date.split("-")[0]}.{date.split("-")[1]} {days[i-1]}\n\n'  
-                for j in range(2, len(subjects), 4):
-                    text += f'{subjects[j].text}: {subjects[j+1].text} | {subjects[j+2].text} | {subjects[j+3].text}\n'
-                
-                text += '\n'
-                date = functions.return_date(date, 1)
-        
-        if len(text.split('\n')) == 3:
-            functions.edit_message(vk, peer_id, cmid, 'Пар на сайте нет, проверь введенную группу, дату или сайт колледжа, возможно он немножко споткнулся :(')     
+def parse_handler(vk, peer_id, cmid, date, type_, data, auto = False):
+    if type_ == 'auditory':
+        text, tail = auditory_parse(date, data)
+        if text in errors:
+            handle_errors_answer(vk, peer_id, text, auto, 'номер аудитории', cmid if not auto else False)
         else:
             functions.edit_message(vk, peer_id, cmid, text, attachment = 'photo-219074729_457239017')
+            db.create_note(chat_id = peer_id, auditories = tail)
+    elif type_ == 'group':
+        text, tail = group_parse(date, data)
+        if text in errors:
+            handle_errors_answer(vk, peer_id, text, auto, 'номер группы', cmid if not auto else False)
+        else:
+            if auto:
+                functions.send_message(vk, peer_id, text, attachment = 'photo-219074729_457239017', pin = db.get_note(peer_id)['settings']['AutoPin'])
+            else:
+                functions.edit_message(vk, peer_id, cmid, text, attachment = 'photo-219074729_457239017')
+            db.create_note(chat_id = peer_id, groups = tail)
+    elif type_ == 'teacher':
+        text, tail = teacher_parse(date, data)
+        if text in errors:
+            handle_errors_answer(vk, peer_id, text, auto, 'фамилию преподавателя', cmid if not auto else False)
+        else:
+            functions.edit_message(vk, peer_id, cmid, text, attachment = 'photo-219074729_457239017')
+            db.create_note(chat_id = peer_id, teachers = tail)
+    
+def handle_errors_answer(vk, peer_id, text, auto, type_, cmid):
+    if auto:
+        if text == 'ConnectionError':
+            functions.send_message(vk, peer_id, 'Сайт сейчас не работает. Повторите попытку самостоятельно немного позже 😔')
+        elif text == 'ExpValueError':
+            functions.send_message(vk, peer_id, 'Я не нашел пар на сайте колледжа. Попробуйте еще раз вызвать проверку, или самостоятельно зайдите на сайт колледжа 😔')
+    else:
+        if text == 'ConnectionError':
+            functions.edit_message(vk, peer_id, cmid, 'Сайт сейчас не работает. Повторите попытку позже 😔')
+        elif text == 'ExpValueError':
+            functions.edit_message(vk, peer_id, cmid, f'Пар на сайте нет. Проверьте выбранные дату и {type_} 🙂')
+        elif text == 'WeekendError':
+            functions.edit_message(vk, peer_id, cmid, 'Пар на сайте нет, так как указанный вами день - выходной. Проверьте введенную дату 🙂')
 
-    def teacher_parse(vk, peer_id, cmid, date, teacher):
-        text = f'Расписание для преподавателя '
-        week_day = datetime.strptime(date, '%d-%m-%Y')
-        week_day = datetime.isoweekday(week_day)
-        days = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота']
-        flag = False
-        teacher_flag = False
-        pos = 0
+def get_response(url, data, js = False):
+    try:
+        response = requests.post(url, data = data, timeout = 5)
+        if js:
+            response_dict = json.loads(response.text)
+    except requests.exceptions.Timeout:
+        return 'ConnectionError'
+    except json.decoder.JSONDecodeError:
+        return 'ExpValueError'
+    
+    return response if not js else response_dict
 
-        if week_day == 7:
-            functions.edit_message(vk, peer_id, cmid, text = 'Это выходной, отдохни. Уже совсем бошка не варит :|')
-            return
+days = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота']
+def group_parse(date, group):
+    text = f'Расписание для группы {group}\n\n'
 
-        for i in range(week_day, 7, 1):
-            date_response = requests.post('https://www.uc.osu.ru/back_parametr.php', data = {'type_id': '2', 'data': date})
-            try:
-                date_response_dict = json.loads(date_response.text)
-            except:
-                date = functions.return_date(date, 1)
-                continue
-            
-            teacher_name = ''
-            teacher_for_flag = ''
+    week_day = datetime.weekday(datetime.strptime(date, '%d-%m-%Y'))
+    if week_day == 6:
+        return 'WeekendError', ''
 
-            if date_response_dict:
-                for key, value in date_response_dict.items():
-                    if teacher.upper() in value.upper():
-                        teacher_name = value
-                        
-                        if not teacher_flag:
-                            if ' ' not in value:
-                                for j in range(1, len(value)):
-                                    if value[j].isupper():
-                                        pos = j
-                                        break
+    flag = False
+    for i in range(week_day, 6, 1):
+        response = get_response('https://www.uc.osu.ru/back_parametr.php', {'type_id': '1', 'data': date}, js = True)
+        if response == 'ConnectionError':
+            return response, ''
+        elif response == 'ExpValueError':
+            date = functions.return_date(date, 1)
+            continue
+        
+        group_id = ''
+        for key, value in response.items():
+            if value.lower() == group.lower():
+                group_id = key
 
-                                value = value[:pos] + ' ' + value[pos:]     
-
-                            db.create_note(chat_id = peer_id, teachers = value)
-                            teacher_flag = True
-                            teacher_for_flag = value
-                                    
-                if teacher_name == '':
-                    date = functions.return_date(date, 1)
-                    continue
-                    
                 if not flag:
-                    text += f'{teacher_for_flag}\n\n'
+                    db_group_name = value.upper()
                     flag = True
 
-                response = requests.post('https://www.uc.osu.ru/generate_data.php', data = {'type': '2', 'data': date, 'id': teacher_name})
-                result = bs(response.text, 'lxml')
-                text += f'{date.split("-")[0]}.{date.split("-")[1]} {days[i-1]}\n\n'  
-                
-                if len(result) == 0:
-                    text += 'Расписания на данную дату нет, возможно ошибка\n'
-                    continue
-                    
-                subjects = result.find_all('td')
-                
-                for j in range(0, len(subjects), 4):
-                    text += f'{subjects[j].text}: {subjects[j+1].text} | {subjects[j+2].text} | {subjects[j+3].text}\n'
-                
-                text += '\n'
-                date = functions.return_date(date, 1)
+        if group_id == '':
+            functions.return_date(date, 1)
+            continue
 
-        if len(text.split('\n')) == 1:
-            functions.edit_message(vk, peer_id, cmid, 'Пар на сайте нет, проверь введенную фамилию преподавателя, дату или сайт колледжа, возможно он немножко споткнулся :(')
-        else:     
-            functions.edit_message(vk, peer_id, cmid, text, attachment = 'photo-219074729_457239017')
+        lessons_response = get_response('https://www.uc.osu.ru/generate_data.php', {'type': '1', 'data': date, 'id': group_id})
+        page = bs(lessons_response.text, 'lxml')
+        if len(page) == 0:
+            continue
 
-    def audit_parse(vk, peer_id, cmid, date, audit):
-        date_response = requests.post('https://www.uc.osu.ru/back_parametr.php', data = {'type_id': '1', 'data': date})
-        days = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота']
+        lessons = page.find_all('td')
+        if len(lessons) == 2:
+            continue
+
+        text += f'{date.split("-")[0]}.{date.split("-")[1]} {days[i]}\n\n'
+        for j in range(2, len(lessons), 4):
+            text += f'{lessons[j].text}: {lessons[j+1].text} | {lessons[j+2].text} | {lessons[j+3].text}\n'
+        text += '\n'
+
+        date = functions.return_date(date, 1)
+
+    if len(text.split('\n')) == 3:
+        return 'ExpValueError', ''
+    
+    return text, db_group_name
+
+def teacher_parse(date, teacher):
+    text = 'Расписание для преподавателя '
+
+    week_day = datetime.weekday(datetime.strptime(date, '%d-%m-%Y'))
+    if week_day == 6:
+        return 'WeekendError', ''
+    
+    flag = False
+    for i in range(week_day, 6, 1):
+        response = get_response('https://www.uc.osu.ru/back_parametr.php', {'type_id': '2', 'data': date}, js = True)
+        if response == 'ConnectionError':
+            return response, ''
+        elif response == 'ExpValueError':
+            date = functions.return_date(date, 1)
+            continue
         
-        try:
-            date_response_dict = json.loads(date_response.text)
-        except:
-            functions.edit_message(vk, peer_id, cmid, 'Пар на сайте нет, проверь введенные номер аудитории, дату или сайт колледжа, возможно он немножко споткнулся :(')
-            return
+        teacher_name = ''
+        for key, value in response.items():
+            if teacher.lower() in value.lower():
+                teacher_name = value
+
+                if ' ' not in value and not flag:
+                    pos = [j for j in range(1, len(value)) if value[j].isupper()][0]
+                    db_teacher_name = value[:pos] + ' ' + value[pos:]
+                    flag = True
+
+                if not flag:
+                    db_teacher_name = value
+                    flag = True
+
+        if teacher_name == '':
+            date = functions.return_date(date, 1)
+            continue
+
+        if text == 'Расписание для преподавателя ':
+            text += f'{db_teacher_name}\n\n'
         
-        db.create_note(chat_id = peer_id, auditories = str(audit))
-        session = sessions.FuturesSession(max_workers=5)
-        futures = [session.post('https://www.uc.osu.ru/generate_data.php', data = {'type': '1', 'data': date, 'id': key}) for key, value in date_response_dict.items()]
-        s = []
+        lessons_response = get_response('https://www.uc.osu.ru/generate_data.php', data = {'type': '2', 'data': date, 'id': teacher_name})
+        page = bs(lessons_response.text, 'lxml')
+        if len(page) == 0:
+            continue
 
-        for f in futures:
-            res = bs(f.result().text, 'lxml')
-            subjects = res.find_all('td')
+        lessons = page.find_all('td')
+        if len(lessons) == 2:
+            continue
+        
+        text += f'{date.split("-")[0]}.{date.split("-")[1]} {days[i]}\n\n'
+        for j in range(0, len(lessons), 4):
+            text += f'{lessons[j].text}: {lessons[j+1].text} | {lessons[j+2].text} | {lessons[j+3].text}\n'
+        text += '\n'
+        
+        date = functions.return_date(date, 1)
 
-            for j in range(2, len(subjects), 4):
-                if subjects[j+2].text == str(audit):
-                    s.append(f'{subjects[j].text}: {subjects[j+1].text} | {subjects[1].text} | {subjects[j+3].text}')
+    if len(text.split('\n')) == 1:
+        return 'ExpValueError', ''
 
-        max = 1
+    return text, db_teacher_name
+
+def auditory_parse(date, auditory):
+    response = get_response('https://www.uc.osu.ru/back_parametr.php', {'type_id': '1', 'data': date}, js = True)
+    if response in errors:
+        return response, ''
+    
+    session = sessions.FuturesSession(max_workers = 5)
+    pages = [session.post('https://www.uc.osu.ru/generate_data.php', data = {'type': '1', 'data': date, 'id': key}) for key, value in response.items()]
+    lessons_list = []
+    for page in pages:
+        lessons_page = bs(page.result().text, 'lxml')
+        lessons = lessons_page.find_all('td')
+        for j in range(2, len(lessons), 4):
+                if lessons[j+2].text == str(auditory):
+                    lessons_list.append(f'{lessons[j].text}: {lessons[j+1].text} | {lessons[1].text} | {lessons[j+3].text}')
+
+    if len(lessons_list) == 0:
+        return 'ExpValueError', ''
+
+    text = f'Расписание для аудитории {str(auditory)}\n\n{date.split("-")[0]}.{date.split("-")[1]} {days[datetime.weekday(datetime.strptime(date, "%d-%m-%Y"))]}\n\n'
+    max_lesson_number = 1
+
+    for i in range(6):
         flag = False
+        for lesson in lessons_list:
+            if lesson[0] == str(max_lesson_number) and not flag:
+                text += f'{max_lesson_number}: {lesson[3:]}\n'
+                flag = True
+            elif lesson[0] == str(max_lesson_number) and flag:
+                text += f'   {lesson[3:]}\n'
+        max_lesson_number += 1 
 
-        if len(s) == 0:
-            functions.edit_message(vk, peer_id, cmid, 'В данном кабинете нет занятий на данную дату!')
-            return
-
-        text = f'Расписание для аудитории {str(audit)}\n\n{date.split("-")[0]}.{date.split("-")[1]} {days[datetime.weekday(datetime.strptime(date, "%d-%m-%Y"))]}\n\n'
-
-        for i in range(6):
-            for _ in s:
-                flag = False
-                for __ in s:
-                    if __[0] == str(max) and flag == False:
-                        text += f'{max}: {__[3:]}\n'
-                        flag = True
-                    elif __[0] == str(max) and flag:
-                        text += f'   {__[3:]}\n'
-                max += 1
-
-        functions.edit_message(vk, peer_id, cmid, text, attachment = 'photo-219074729_457239017')
+    return text, str(auditory)
